@@ -1,9 +1,9 @@
 use aws_config::SdkConfig;
 use aws_sdk_kms as kms;
 use aws_sdk_rds as rds;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Parser, ValueEnum};
-use inquire::InquireError;
-use inquire::Select;
+use inquire::{Confirm, InquireError, Select};
 use kms::model::AliasListEntry;
 use kms::model::KeyListEntry;
 use std::collections::HashMap;
@@ -22,6 +22,9 @@ struct Args {
 
     #[arg(value_enum, short = 't', long, default_value_t = DatabaseType::Database)]
     db_type: DatabaseType,
+
+    #[arg(short, long)]
+    snapshot_id: Option<String>,
 
     #[arg()]
     account_ids: Option<Vec<String>>,
@@ -83,6 +86,65 @@ impl RDS {
         Ok(clusters
             .iter()
             .map(|db| db.db_cluster_identifier().unwrap().to_string())
+            .collect())
+    }
+
+    async fn describe_db_cluster_snapshots(
+        &self,
+        identifier: String,
+    ) -> Result<Vec<String>, rds::Error> {
+        let paginator = self
+            .client
+            .describe_db_cluster_snapshots()
+            .db_cluster_identifier(identifier)
+            .into_paginator()
+            .items()
+            .send();
+
+        let snapshots = paginator.collect::<Result<Vec<_>, _>>().await?;
+
+        Ok(snapshots
+            .iter()
+            .map(|s| {
+                let snapshot_id = s.db_cluster_snapshot_identifier().unwrap();
+                let timestamp = s.snapshot_create_time().unwrap().secs();
+
+                let naive = NaiveDateTime::from_timestamp_opt(timestamp, 0).unwrap();
+                let datetime: DateTime<Utc> = DateTime::from_utc(naive, Utc);
+
+                format!("{}|{}", snapshot_id, datetime.format("%Y-%m-%d %H:%M:%S"))
+            })
+            .collect())
+    }
+
+    async fn describe_db_snapshot_attributes(
+        &self,
+        snapshot_id: String,
+    ) -> Result<HashMap<String, Vec<String>>, rds::Error> {
+        let resp = self
+            .client
+            .describe_db_snapshot_attributes()
+            .db_snapshot_identifier(snapshot_id)
+            .send()
+            .await
+            .unwrap();
+
+        let res = resp.db_snapshot_attributes_result().unwrap();
+
+        Ok(res
+            .db_snapshot_attributes()
+            .unwrap()
+            .iter()
+            .map(|attr| {
+                (
+                    attr.attribute_name().unwrap().to_string(),
+                    attr.attribute_values()
+                        .unwrap()
+                        .iter()
+                        .map(String::from)
+                        .collect(),
+                )
+            })
             .collect())
     }
 }
@@ -203,6 +265,14 @@ fn select_keys(keys: Vec<Key>) -> Result<String, InquireError> {
     Ok(key.unwrap().id.clone())
 }
 
+fn select_snapshot(snapshots: Vec<String>) -> Result<String, InquireError> {
+    select("Select a snapshot to copy", snapshots)
+}
+
+fn confirm_use_exisitng_snapshot() -> Result<bool, InquireError> {
+    Confirm::new("Use an existing snapshot").prompt()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), rds::Error> {
     let args = Args::parse();
@@ -221,7 +291,8 @@ async fn main() -> Result<(), rds::Error> {
 
             select_rds(identifiers)
         }
-    };
+    }
+    .unwrap();
 
     let kms_key_id = match args.kms_key_id {
         Some(kms_key_id) => Ok(kms_key_id),
@@ -230,17 +301,30 @@ async fn main() -> Result<(), rds::Error> {
 
             select_keys(keys)
         }
+    }
+    .unwrap();
+
+    let use_existing_snapshot = confirm_use_exisitng_snapshot();
+
+    let snapshot = match args.snapshot_id {
+        Some(snap) => snap,
+        None => {
+            let snapshots = rds
+                .describe_db_cluster_snapshots(identifier.clone())
+                .await
+                .unwrap();
+
+            select_snapshot(snapshots).unwrap()
+        }
     };
 
-    println!("{}", identifier.unwrap());
-    println!("{}", kms_key_id.unwrap());
-
-    // println!("\nPrinting databases\n");
-    // let instances = describe_instances(&client).await.unwrap();
-    //
-    // for instance in instances {
-    //     println!("{}", instance.db_instance_identifier().unwrap());
-    // }
+    println!(
+        "{} {} {} {}",
+        &identifier,
+        &kms_key_id,
+        use_existing_snapshot.unwrap(),
+        &snapshot,
+    );
 
     Ok(())
 }
